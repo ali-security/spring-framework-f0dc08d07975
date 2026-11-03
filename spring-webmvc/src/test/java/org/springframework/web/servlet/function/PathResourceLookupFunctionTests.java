@@ -17,13 +17,19 @@
 package org.springframework.web.servlet.function;
 
 import java.io.File;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Collections;
 import java.util.Optional;
 import java.util.function.Function;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import org.springframework.core.io.ClassPathResource;
+import org.springframework.core.io.FileSystemResource;
 import org.springframework.core.io.Resource;
 import org.springframework.web.servlet.handler.PathPatternsTestUtils;
 
@@ -33,6 +39,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * @author Arjen Poutsma
  */
 class PathResourceLookupFunctionTests {
+
+	@TempDir
+	Path tempDir;
 
 	@Test
 	void normal() throws Exception {
@@ -94,6 +103,44 @@ class PathResourceLookupFunctionTests {
 		assertThat(result).isPresent();
 
 		assertThat(result.get().getFile()).isEqualTo(defaultResource.getFile());
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = {
+			"ĮĮįsecret%2Etxt",
+			"sub/../%25C4%25AE%25C4%25AE%25C4%25AFsecret%25252Etxt",
+			"sub/%2e%2e/%25C4%25AE%25C4%25AE%25C4%25AFsecret%25252Etxt"
+	})
+	void fileSystemResourceLocationWithTraversalRevealedByDecodingNonAsciiCharacters(String path) throws Exception {
+		// U+012E and U+012F must not be truncated to '.' and '/' while decoding
+		// the path for the location, after it has passed validation.
+		PathResourceLookupFunction function = new PathResourceLookupFunction("/resources/**", initFileSystemLocation());
+
+		Optional<Resource> result = function.apply(initRequest("GET", "/resources/" + path));
+		assertThat(result).isNotPresent();
+	}
+
+	@ParameterizedTest
+	@ValueSource(strings = {
+			"%20śpřìńġ.txt",
+			"%20%C5%9Bp%C5%99%C3%AC%C5%84%C4%A1.txt"
+	})
+	void fileSystemResourceLocationWithEncodedNonAsciiFilename(String path) throws Exception {
+		Resource location = initFileSystemLocation();
+		Files.writeString(this.tempDir.resolve("static/ śpřìńġ.txt"), "file");
+		PathResourceLookupFunction function = new PathResourceLookupFunction("/resources/**", location);
+
+		Optional<Resource> result = function.apply(initRequest("GET", "/resources/" + path));
+		assertThat(result).isPresent();
+		assertThat(result.get().getFile()).isEqualTo(this.tempDir.resolve("static/ śpřìńġ.txt").toFile());
+	}
+
+	private Resource initFileSystemLocation() throws Exception {
+		Path location = Files.createDirectories(this.tempDir.resolve("static"));
+		Files.createDirectories(location.resolve("sub"));
+		Files.writeString(location.resolve("sub/file.txt"), "file");
+		Files.writeString(this.tempDir.resolve("secret.txt"), "secret");
+		return new FileSystemResource(location.toString() + "/");
 	}
 
 	private ServerRequest initRequest(String httpMethod, String requestUri) {

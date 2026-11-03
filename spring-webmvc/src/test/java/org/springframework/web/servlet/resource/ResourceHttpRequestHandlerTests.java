@@ -17,6 +17,8 @@
 package org.springframework.web.servlet.resource;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 
 import jakarta.servlet.http.HttpServletResponse;
@@ -24,6 +26,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.api.io.TempDir;
 
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.core.io.FileSystemResource;
@@ -40,6 +43,7 @@ import org.springframework.web.servlet.HandlerMapping;
 import org.springframework.web.testfixture.servlet.MockHttpServletRequest;
 import org.springframework.web.testfixture.servlet.MockHttpServletResponse;
 import org.springframework.web.testfixture.servlet.MockServletContext;
+import org.springframework.web.util.ServletRequestPathUtils;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
@@ -709,6 +713,50 @@ class ResourceHttpRequestHandlerTests {
 			this.request.setAttribute(HandlerMapping.PATH_WITHIN_HANDLER_MAPPING_ATTRIBUTE, requestPath);
 			this.response = new MockHttpServletResponse();
 			assertNotFound();
+		}
+
+		@Test
+		void shouldRejectTraversalRevealedByDecodingNonAsciiCharacters(@TempDir Path tempDir) throws Exception {
+			// U+012E and U+012F must not be truncated to '.' and '/' while decoding
+			// the path for the resolver, after it has passed validation.
+			Path location = Files.createDirectories(tempDir.resolve("static"));
+			Files.writeString(tempDir.resolve("secret.txt"), "secret");
+
+			this.handler.setLocations(List.of(new FileSystemResource(location.toString() + "/")));
+			this.handler.afterPropertiesSet();
+
+			for (String path : List.of(
+					"ĮĮįsecret%2Etxt",
+					"x/../%25C4%25AE%25C4%25AE%25C4%25AFsecret%25252Etxt",
+					"x/%2e%2e/%25C4%25AE%25C4%25AE%25C4%25AFsecret%25252Etxt")) {
+				this.request = new MockHttpServletRequest(new TestServletContext(), "GET", "/resources/" + path);
+				ServletRequestPathUtils.parseAndCache(this.request);
+				this.request.setAttribute(HandlerMapping.PATH_WITHIN_HANDLER_MAPPING_ATTRIBUTE, path);
+				this.response = new MockHttpServletResponse();
+				assertNotFound();
+				assertThat(this.response.getContentAsString()).doesNotContain("secret");
+			}
+		}
+
+		@Test
+		void servesResourceWithEncodedNonAsciiPath(@TempDir Path tempDir) throws Exception {
+			Path location = Files.createDirectories(tempDir.resolve("static"));
+			Files.writeString(location.resolve(" śpřìńġ.txt"), "spring");
+
+			this.handler.setLocations(List.of(new FileSystemResource(location.toString() + "/")));
+			this.handler.afterPropertiesSet();
+
+			for (String path : List.of(
+					"%20śpřìńġ.txt",
+					"%20%C5%9Bp%C5%99%C3%AC%C5%84%C4%A1.txt")) {
+				this.request = new MockHttpServletRequest(new TestServletContext(), "GET", "/resources/" + path);
+				ServletRequestPathUtils.parseAndCache(this.request);
+				this.request.setAttribute(HandlerMapping.PATH_WITHIN_HANDLER_MAPPING_ATTRIBUTE, path);
+				this.response = new MockHttpServletResponse();
+				this.handler.handleRequest(this.request, this.response);
+				assertThat(this.response.getStatus()).isEqualTo(200);
+				assertThat(this.response.getContentAsString()).isEqualTo("spring");
+			}
 		}
 
 		@Test
