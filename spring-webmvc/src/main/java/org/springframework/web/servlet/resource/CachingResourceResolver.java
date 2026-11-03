@@ -17,10 +17,8 @@
 package org.springframework.web.servlet.resource;
 
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
-import java.util.Locale;
 import java.util.stream.Collectors;
 
 import jakarta.servlet.http.HttpServletRequest;
@@ -28,7 +26,6 @@ import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
 import org.springframework.core.io.Resource;
-import org.springframework.http.HttpHeaders;
 import org.springframework.lang.Nullable;
 import org.springframework.util.Assert;
 import org.springframework.util.StringUtils;
@@ -141,15 +138,12 @@ public class CachingResourceResolver extends AbstractResourceResolver {
 
 	@Nullable
 	private String getContentCodingKey(HttpServletRequest request) {
-		String header = request.getHeader(HttpHeaders.ACCEPT_ENCODING);
-		if (!StringUtils.hasText(header)) {
+		List<String> acceptedCodings = EncodedResourceResolver.parseAcceptEncoding(request);
+		if (acceptedCodings.isEmpty()) {
 			return null;
 		}
-		return Arrays.stream(StringUtils.tokenizeToStringArray(header, ","))
-				.map(token -> {
-					int index = token.indexOf(';');
-					return (index >= 0 ? token.substring(0, index) : token).trim().toLowerCase(Locale.ROOT);
-				})
+		return acceptedCodings
+				.stream()
 				.filter(this.contentCodings::contains)
 				.sorted()
 				.collect(Collectors.joining(","));
