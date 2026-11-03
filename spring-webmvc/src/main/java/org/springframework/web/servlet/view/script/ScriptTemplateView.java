@@ -18,10 +18,12 @@ package org.springframework.web.servlet.view.script;
 
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.net.URLDecoder;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HexFormat;
 import java.util.Locale;
 import java.util.Map;
 import java.util.function.Function;
@@ -43,7 +45,10 @@ import org.springframework.beans.factory.NoSuchBeanDefinitionException;
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.ApplicationContextException;
 import org.springframework.core.NamedThreadLocal;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.core.io.Resource;
+import org.springframework.core.io.UrlResource;
+import org.springframework.core.log.LogFormatUtils;
 import org.springframework.lang.Nullable;
 import org.springframework.scripting.support.StandardScriptEvalException;
 import org.springframework.scripting.support.StandardScriptUtils;
@@ -51,6 +56,7 @@ import org.springframework.util.Assert;
 import org.springframework.util.FileCopyUtils;
 import org.springframework.util.ObjectUtils;
 import org.springframework.util.StringUtils;
+import org.springframework.web.context.support.ServletContextResource;
 import org.springframework.web.servlet.support.RequestContextUtils;
 import org.springframework.web.servlet.view.AbstractUrlBasedView;
 
@@ -352,15 +358,258 @@ public class ScriptTemplateView extends AbstractUrlBasedView {
 
 	@Nullable
 	protected Resource getResource(String location) {
-		if (this.resourceLoaderPaths != null) {
+		String normalizedLocation = normalizeInputPath(location);
+		if (this.resourceLoaderPaths != null && !shouldIgnoreInputPath(normalizedLocation)) {
+			ApplicationContext context = obtainApplicationContext();
 			for (String path : this.resourceLoaderPaths) {
-				Resource resource = obtainApplicationContext().getResource(path + location);
-				if (resource.exists()) {
-					return resource;
+				Resource resource = context.getResource(path + normalizedLocation);
+				try {
+					if (resource.exists() && isResourceUnderLocation(context.getResource(path), resource)) {
+						return resource;
+					}
+				}
+				catch (IOException ex) {
+					if (logger.isDebugEnabled()) {
+						String error = "Skip location [" + normalizedLocation + "] due to error";
+						if (logger.isTraceEnabled()) {
+							logger.trace(error, ex);
+						}
+						else {
+							logger.debug(error + ": " + ex.getMessage());
+						}
+					}
 				}
 			}
 		}
 		return null;
+	}
+
+	/**
+	 * Normalize the given resource location, replacing the following:
+	 * <ul>
+	 * <li>Backslash with forward slash.
+	 * <li>Duplicate occurrences of slash with a single slash.
+	 * <li>Any combination of leading slash and control characters (00-1F and 7F)
+	 * with a single "/" or "". For example {@code "  / // foo/bar"}
+	 * becomes {@code "/foo/bar"}.
+	 * </ul>
+	 */
+	private static String normalizeInputPath(String path) {
+		path = StringUtils.replace(path, "\\", "/");
+		path = cleanDuplicateSlashes(path);
+		return cleanLeadingSlash(path);
+	}
+
+	private static String cleanDuplicateSlashes(String path) {
+		StringBuilder sb = null;
+		char prev = 0;
+		for (int i = 0; i < path.length(); i++) {
+			char curr = path.charAt(i);
+			try {
+				if ((curr == '/') && (prev == '/')) {
+					if (sb == null) {
+						sb = new StringBuilder(path.substring(0, i));
+					}
+					continue;
+				}
+				if (sb != null) {
+					sb.append(path.charAt(i));
+				}
+			}
+			finally {
+				prev = curr;
+			}
+		}
+		return (sb != null ? sb.toString() : path);
+	}
+
+	private static String cleanLeadingSlash(String path) {
+		boolean slash = false;
+		for (int i = 0; i < path.length(); i++) {
+			if (path.charAt(i) == '/') {
+				slash = true;
+			}
+			else if (path.charAt(i) > ' ' && path.charAt(i) != 127) {
+				if (i == 0 || (i == 1 && slash)) {
+					return path;
+				}
+				return (slash ? "/" + path.substring(i) : path.substring(i));
+			}
+		}
+		return (slash ? "/" : "");
+	}
+
+	/**
+	 * Whether the given input path is invalid as determined by
+	 * {@link #isInvalidPath(String)}. The path is also decoded and the same
+	 * checks are performed again.
+	 */
+	private boolean shouldIgnoreInputPath(String path) {
+		return (!StringUtils.hasText(path) || isInvalidPath(path) || isInvalidEncodedPath(path));
+	}
+
+	/**
+	 * Checks for invalid resource input paths rejecting the following:
+	 * <ul>
+	 * <li>Paths that contain "../" after a call to
+	 * {@link org.springframework.util.StringUtils#cleanPath}.
+	 * </ul>
+	 * <p>Script and template locations are configured by the application and may
+	 * legitimately point to {@code META-INF} (e.g. WebJars) or use a URL prefix,
+	 * so such paths are not rejected here; they remain subject to the check
+	 * that the resolved resource is under the configured resource loader path.
+	 * <p><strong>Note:</strong> this method assumes that leading, duplicate '/'
+	 * or control characters (e.g. white space) have been trimmed so that the
+	 * path starts predictably with a single '/' or does not have one.
+	 * @param path the path to validate
+	 * @return {@code true} if the path is invalid, {@code false} otherwise
+	 */
+	private boolean isInvalidPath(String path) {
+		if (path.contains("../")) {
+			if (logger.isWarnEnabled()) {
+				logger.warn(LogFormatUtils.formatValue(
+						"Path contains \"../\" after call to StringUtils#cleanPath: [" + path + "]", -1, true));
+			}
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Check whether the given path contains invalid escape sequences.
+	 * @param path the path to validate
+	 * @return {@code true} if the path is invalid, {@code false} otherwise
+	 */
+	private boolean isInvalidEncodedPath(String path) {
+		String decodedPath = decode(path);
+		if (decodedPath.contains("%")) {
+			decodedPath = decode(decodedPath);
+		}
+		if (!StringUtils.hasText(decodedPath)) {
+			return true;
+		}
+		if (isInvalidPath(decodedPath)) {
+			return true;
+		}
+		decodedPath = normalizeInputPath(decodedPath);
+		return isInvalidPath(decodedPath);
+	}
+
+	private static String decode(String path) {
+		try {
+			return uriDecode(path, StandardCharsets.UTF_8);
+		}
+		catch (Exception ex) {
+			return "";
+		}
+	}
+
+	/**
+	 * Decode the given encoded URI component value by replacing "<i>{@code %xy}</i>"
+	 * sequences by an hexadecimal representation of the character in the specified
+	 * charset, letting other characters unchanged.
+	 * @param source the encoded {@code String}
+	 * @param charset the character encoding to use to decode the "<i>{@code %xy}</i>" sequences
+	 * @return the decoded value
+	 * @throws IllegalArgumentException when the given source contains invalid encoded sequences
+	 */
+	private static String uriDecode(String source, Charset charset) {
+		int length = source.length();
+		int firstPercentIndex = source.indexOf('%');
+		if (length == 0 || firstPercentIndex < 0) {
+			return source;
+		}
+
+		StringBuilder output = new StringBuilder(length);
+		output.append(source, 0, firstPercentIndex);
+		byte[] bytes = null;
+		int i = firstPercentIndex;
+		while (i < length) {
+			char ch = source.charAt(i);
+			if (ch == '%') {
+				try {
+					if (bytes == null) {
+						bytes = new byte[(length - i) / 3];
+					}
+
+					int pos = 0;
+					while (i + 2 < length && ch == '%') {
+						bytes[pos++] = (byte) HexFormat.fromHexDigits(source, i + 1, i + 3);
+						i += 3;
+						if (i < length) {
+							ch = source.charAt(i);
+						}
+					}
+
+					if (i < length && ch == '%') {
+						throw new IllegalArgumentException("Incomplete trailing escape (%) pattern");
+					}
+
+					output.append(new String(bytes, 0, pos, charset));
+				}
+				catch (NumberFormatException ex) {
+					throw new IllegalArgumentException("Invalid encoded sequence \"" + source.substring(i) + "\"");
+				}
+			}
+			else {
+				output.append(ch);
+				i++;
+			}
+		}
+		return output.toString();
+	}
+
+	/**
+	 * Check whether the resource is under the given location.
+	 */
+	private boolean isResourceUnderLocation(Resource location, Resource resource) throws IOException {
+		if (resource.getClass() != location.getClass()) {
+			return false;
+		}
+
+		String resourcePath;
+		String locationPath;
+
+		if (resource instanceof UrlResource) {
+			resourcePath = resource.getURL().toExternalForm();
+			locationPath = StringUtils.cleanPath(location.getURL().toString());
+		}
+		else if (resource instanceof ClassPathResource classPathResource) {
+			resourcePath = classPathResource.getPath();
+			locationPath = StringUtils.cleanPath(((ClassPathResource) location).getPath());
+		}
+		else if (resource instanceof ServletContextResource servletContextResource) {
+			resourcePath = servletContextResource.getPath();
+			locationPath = StringUtils.cleanPath(((ServletContextResource) location).getPath());
+		}
+		else {
+			resourcePath = resource.getURL().getPath();
+			locationPath = StringUtils.cleanPath(location.getURL().getPath());
+		}
+
+		if (locationPath.equals(resourcePath)) {
+			return true;
+		}
+		locationPath = (locationPath.endsWith("/") || locationPath.isEmpty() ? locationPath : locationPath + "/");
+		return (resourcePath.startsWith(locationPath) && !isInvalidEncodedResourcePath(resourcePath));
+	}
+
+	private boolean isInvalidEncodedResourcePath(String resourcePath) {
+		if (resourcePath.contains("%")) {
+			// Use URLDecoder (vs UriUtils) to preserve potentially decoded UTF-8 chars...
+			try {
+				String decodedPath = URLDecoder.decode(resourcePath, StandardCharsets.UTF_8);
+				if (decodedPath.contains("../") || decodedPath.contains("..\\")) {
+					logger.warn(LogFormatUtils.formatValue(
+							"Resolved resource path contains encoded \"../\" or \"..\\\": " + resourcePath, -1, true));
+					return true;
+				}
+			}
+			catch (IllegalArgumentException ex) {
+				// May not be possible to decode...
+			}
+		}
+		return false;
 	}
 
 	protected ScriptTemplateConfig autodetectViewConfig() throws BeansException {
